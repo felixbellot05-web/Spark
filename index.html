@@ -481,3 +481,336 @@ window.addEventListener('load',function(){
 </script>
 </body>
 </html>
+import anthropic
+import requests
+import os
+import json
+import re
+from datetime import datetime, timezone, timedelta
+
+# ── Fetch live NBA data from ESPN's public API ─────────────────────
+def get_nba_schedule():
+    try:
+        url = "http://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        games = []
+        for event in data.get("events", []):
+            comp = event["competitions"][0]
+            home = next(t for t in comp["competitors"] if t["homeAway"] == "home")
+            away = next(t for t in comp["competitors"] if t["homeAway"] == "away")
+            game = {
+                "home": home["team"]["displayName"],
+                "homeAbbr": home["team"]["abbreviation"],
+                "homeRecord": home.get("records", [{}])[0].get("summary", ""),
+                "away": away["team"]["displayName"],
+                "awayAbbr": away["team"]["abbreviation"],
+                "awayRecord": away.get("records", [{}])[0].get("summary", ""),
+                "time": event.get("date", ""),
+                "status": comp["status"]["type"]["name"]
+            }
+            games.append(game)
+        return games
+    except Exception as e:
+        return []
+
+def get_injuries():
+    try:
+        url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        injuries = []
+        for team_data in data.get("injuries", []):
+            team = team_data.get("team", {}).get("displayName", "")
+            for inj in team_data.get("injuries", []):
+                athlete = inj.get("athlete", {}).get("displayName", "")
+                status = inj.get("status", "")
+                desc = inj.get("injuries", [{}])[0].get("longComment", "") if inj.get("injuries") else ""
+                injuries.append(f"{athlete} ({team}) - {status}: {desc[:80]}")
+        return injuries[:20]
+    except Exception as e:
+        return []
+
+def convert_to_cet(utc_str):
+    try:
+        dt = datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
+        cet = dt + timedelta(hours=6)
+        return cet.strftime("%H:%M")
+    except:
+        return "TBD"
+
+# ── Read current HTML ──────────────────────────────────────────────
+with open("index.html", "r", encoding="utf-8") as f:
+    current_html = f.read()
+
+# ── Get live data ──────────────────────────────────────────────────
+games = get_nba_schedule()
+injuries = get_injuries()
+
+cet_tz = timezone(timedelta(hours=1))
+today_str = datetime.now(cet_tz).strftime("%A, %B %d %Y")
+date_short = datetime.now(cet_tz).strftime("%b %d").upper()
+
+games_text = ""
+for g in games:
+    cet_time = convert_to_cet(g["time"])
+    games_text += f"- {g['away']} ({g['awayAbbr']}, {g['awayRecord']}) @ {g['home']} ({g['homeAbbr']}, {g['homeRecord']}) — {cet_time} CET\n"
+
+injuries_text = "\n".join(injuries[:15]) if injuries else "No major injuries reported"
+
+# ── Call Claude API ────────────────────────────────────────────────
+client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+prompt = f"""Today is {today_str}.
+
+Here are today's NBA games (fetched live):
+{games_text if games_text else "No games today — use your knowledge for upcoming games"}
+
+Current injury report (fetched live):
+{injuries_text}
+
+You are a professional NBA sports betting analyst. Based on this data and your knowledge of:
+- Current team form and win streaks
+- Home/away records and ATS trends
+- Player performance and matchup advantages
+- Coaching strategies and lineup tendencies
+
+Generate today's NBA betting picks. Return a JSON object with EXACTLY this structure:
+
+{{
+  "date": "{today_str}",
+  "dateShort": "{date_short}",
+  "gamesCount": {len(games)},
+  "low": {{
+    "risk": "LOW",
+    "riskLabel": "Safe Play",
+    "match": "Team A vs Team B",
+    "matchShort": "AAA vs BBB",
+    "pick": "Team Name -X.X",
+    "odds": "-115",
+    "type": "Point Spread",
+    "confidence": 85,
+    "reason": "2-3 sentence explanation with specific stats and reasoning.",
+    "tags": ["Tag1", "Tag2", "Tag3"]
+  }},
+  "mid": {{
+    "risk": "MID",
+    "riskLabel": "Value Pick",
+    "match": "Team C vs Team D",
+    "matchShort": "CCC vs DDD",
+    "pick": "Team Name +X.X",
+    "odds": "-110",
+    "type": "ATS Underdog",
+    "confidence": 72,
+    "reason": "2-3 sentence explanation with specific stats.",
+    "tags": ["Tag1", "Tag2", "Tag3"]
+  }},
+  "high": {{
+    "risk": "HIGH",
+    "riskLabel": "2-Leg Parlay",
+    "match": "2 Games",
+    "matchShort": "2-Leg Parlay",
+    "pick": "Pick 1 + Pick 2",
+    "odds": "+380",
+    "type": "Parlay",
+    "confidence": 48,
+    "reason": "Explain each leg briefly.",
+    "tags": ["High Reward", "Tag2", "Tag3"]
+  }},
+  "props": [
+    {{"player": "Name", "team": "XXX Team", "prop": "Over X.X Points", "odds": "-115", "color": "#30D158", "risk": "LOW", "note": "One sentence reason."}},
+    {{"player": "Name", "team": "XXX Team", "prop": "Over X.X Rebounds", "odds": "+110", "color": "#FFD60A", "risk": "MID", "note": "One sentence reason."}},
+    {{"player": "Name", "team": "XXX Team", "prop": "Over X.X Assists", "odds": "-118", "color": "#FF9F0A", "risk": "MID", "note": "One sentence reason."}}
+  ],
+  "schedule": [
+    {{"home": "Full Name", "homeShort": "HME", "away": "Full Name", "awayShort": "AWY", "homeRecord": "W-L", "awayRecord": "W-L", "timeCET": "01:00", "timeET": "7:00 PM", "channel": "TV", "ourPick": "XXX -7.5"}},
+    {{"home": "Full Name", "homeShort": "HME", "away": "Full Name", "awayShort": "AWY", "homeRecord": "W-L", "awayRecord": "W-L", "timeCET": "02:00", "timeET": "8:00 PM", "channel": "TV", "ourPick": null}}
+  ],
+  "recentResults": [
+    {{"home": "Team", "away": "Team", "homeScore": 115, "awayScore": 108, "date": "Mar 24"}},
+    {{"home": "Team", "away": "Team", "homeScore": 121, "awayScore": 110, "date": "Mar 23"}}
+  ]
+}}
+
+Rules:
+- Use REAL team abbreviations (LAL, BOS, NYK, GSW, etc.)
+- Confidence: LOW=80-92, MID=65-79, HIGH=44-56
+- Prop colors: LOW=#30D158, MID=#FFD60A or #FF9F0A
+- Schedule must list ALL games from the data above
+- Return ONLY the JSON, no other text"""
+
+response = client.messages.create(
+    model="claude-opus-4-6",
+    max_tokens=4000,
+    messages=[{"role": "user", "content": prompt}]
+)
+
+raw = response.content[0].text.strip()
+
+# Clean JSON from response
+json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+if not json_match:
+    print("ERROR: No JSON found in response")
+    print(raw[:500])
+    exit(1)
+
+data = json.loads(json_match.group())
+
+# ── Inject data into HTML ──────────────────────────────────────────
+def make_game_card(g):
+    pick_badge = f'<div class="pb">OUR PICK: {g["ourPick"]}</div>' if g.get("ourPick") else ''
+    return f'''
+      <div class="gc">
+        <div class="gt">
+          <div class="gti"><div class="sd" style="background:#FFD60A;box-shadow:0 0 6px rgba(255,214,10,.55)"></div><span class="tli">{g["timeCET"]} CET</span></div>
+          {pick_badge}
+        </div>
+        <div class="gm">
+          <div class="tc"><div class="ta">{g["awayShort"]}</div><div class="tr">{g["awayRecord"]}</div></div>
+          <div class="vc"><div class="vt">vs</div><div class="et">{g["timeET"]} ET</div></div>
+          <div class="tc r"><div class="ta">{g["homeShort"]}</div><div class="tr">{g["homeRecord"]}</div></div>
+        </div>
+        <div class="gch">📺 {g["channel"]}</div>
+      </div>'''
+
+def make_result_card(r):
+    return f'''
+      <div class="gc">
+        <div class="gt"><div class="gti"><div class="sd" style="background:#30D158;box-shadow:0 0 6px rgba(48,209,88,.55)"></div><span class="tli">Final · {r["date"]}</span></div></div>
+        <div class="gm">
+          <div class="tc"><div class="ta">{r["away"]}</div><div class="ts">{r["awayScore"]}</div></div>
+          <div class="vc"><div class="vt">—</div></div>
+          <div class="tc r"><div class="ta">{r["home"]}</div><div class="ts">{r["homeScore"]}</div></div>
+        </div>
+      </div>'''
+
+def make_tag(t): return f'<span class="tg">{t}</span>'
+def make_prop_card(p):
+    return f'''
+      <div class="pc">
+        <div class="pl">
+          <div class="pm">
+            <div class="bdg" style="background:{p["color"]}22;border:1px solid {p["color"]}50;color:{p["color"]}">{p["risk"]}</div>
+            <span class="pt">{p["team"]}</span>
+          </div>
+          <div class="pp">{p["player"]}</div>
+          <div class="pli" style="color:{p["color"]}">{p["prop"]}</div>
+          <div class="pn">{p["note"]}</div>
+        </div>
+        <div class="po" style="background:{p["color"]}20;border:1px solid {p["color"]}40;color:{p["color"]}">{p["odds"]}</div>
+      </div>'''
+
+lo = data["low"]
+mi = data["mid"]
+hi = data["high"]
+
+# Build schedule HTML
+schedule_html = "\n".join(make_game_card(g) for g in data["schedule"])
+results_html  = "\n".join(make_result_card(r) for r in data.get("recentResults", []))
+props_html    = "\n".join(make_prop_card(p) for p in data["props"])
+
+# Replace dynamic content in HTML using markers
+html = current_html
+
+def replace_between(html, start_marker, end_marker, new_content):
+    pattern = re.compile(re.escape(start_marker) + r'.*?' + re.escape(end_marker), re.DOTALL)
+    return pattern.sub(start_marker + new_content + end_marker, html)
+
+# Update date
+html = re.sub(r'(<span class="d1" id="jd">)[^<]*(</span>)', f'\\g<1>{data["dateShort"]}\\g<2>', html)
+html = re.sub(r'(<span class="d2">🏀 )[^<]*(</span>)', f'\\g<1>{data["gamesCount"]} Games\\g<2>', html)
+
+# Update LOW card
+html = re.sub(r'(id="f-l"[^>]*></div></div></div>\s*<div class="bc-b">\s*<div class="tl">)[^<]*(</div>\s*<div class="pk">)[^<]*(</div>)',
+    f'\\g<1>{lo["type"]} · {lo["matchShort"]}\\g<2>{lo["pick"]}\\g<3>', html)
+html = re.sub(r'(id="f-l".*?style="background:#30D158">)[^<]*(</div></div></div>\s*<div class="cw">.*?<span class="conf-pct"[^>]*>)[^<]*(</span>)',
+    f'\\g<1>\\g<2>{lo["confidence"]}%\\g<3>', html, flags=re.DOTALL)
+
+# Simpler targeted replacements using unique identifiers
+# LOW bet
+html = re.sub(r'(id="bc-l"[^>]*>.*?class="tl">)[^<]*(</div>\s*<div class="pk">)[^<]*(</div>)',
+    f'\\g<1>{lo["type"]} · {lo["matchShort"]}\\g<2>{lo["pick"]}\\g<3>', html, flags=re.DOTALL)
+html = re.sub(r'(id="f-l"[^>]*>)', f'\\g<1>', html)
+html = re.sub(r'(style="background:#30D158">\s*-115)', f'style="background:rgba(48,209,88,.12);border:1px solid rgba(48,209,88,.28);color:#30D158">{lo["odds"]}', html)
+
+# Use Python string replacement for reliability
+lines = html.split('\n')
+new_lines = []
+skip_mode = None
+game_section_replaced = False
+result_section_replaced = False
+props_section_replaced = False
+
+for i, line in enumerate(lines):
+    if 'id="bc-l"' in line:
+        skip_mode = None
+    new_lines.append(line)
+
+html = '\n'.join(new_lines)
+
+# Write the new HTML using a template approach - rebuild key sections
+# Find and replace the date section
+html = re.sub(r"document\.getElementById\('jd'\)\.textContent\s*=\s*[^;]+;",
+    f"document.getElementById('jd').textContent='{data['dateShort']}';", html)
+
+# The most reliable approach: rebuild the entire data-driven sections
+# Replace LOW card content
+def replace_card(html, card_id, bet):
+    tags_html = ''.join(f'<span class="tg">{t}</span>' for t in bet['tags'])
+    odds_color = {'LOW':'#30D158','MID':'#FFD60A','HIGH':'#FF453A'}.get(bet['risk'],'#30D158')
+    new_card = f'''<div class="bc" id="{card_id}" onclick="tog('{card_id[-1]}')">
+        <div class="bc-t">
+          <div class="bc-l">
+            <div class="bdg" style="background:{odds_color}22;border:1px solid {odds_color}50;color:{odds_color}">{bet['risk']}</div>
+            <span class="rl">{bet['riskLabel']}</span>
+          </div>
+          <div class="op" style="background:{odds_color}1F;border:1px solid {odds_color}45;color:{odds_color}">{bet['odds']}</div>
+        </div>
+        <div class="bc-b">
+          <div class="tl">{bet['type']} · {bet['matchShort']}</div>
+          <div class="pk">{bet['pick']}</div>
+        </div>
+        <div class="cw">
+          <div class="cr"><span class="ct">Confidence</span><span class="cp" style="color:{odds_color}">{bet['confidence']}%</span></div>
+          <div class="ck"><div class="cf" id="f-{card_id[-1]}" style="background:{odds_color}"></div></div>
+        </div>
+        <div class="bx" id="bx-{card_id[-1]}">
+          <p class="br">{bet['reason']}</p>
+          <div class="tgs">{tags_html}</div>
+        </div>
+        <div class="th" id="th-{card_id[-1]}">▼&nbsp; ANALYSIS</div>
+      </div>'''
+    pattern = re.compile(rf'<div class="bc" id="{card_id}".*?</div>\s*</div>\s*</div>', re.DOTALL)
+    return pattern.sub(new_card, html)
+
+html = replace_card(html, 'bc-l', lo)
+html = replace_card(html, 'bc-m', mi)
+html = replace_card(html, 'bc-h', hi)
+
+# Replace props section
+props_pattern = re.compile(
+    r'(<div id="p-props" class="tp">.*?<div class="sl">.*?</div>)(.*?)(<div class="cb")',
+    re.DOTALL)
+html = props_pattern.sub(lambda m: m.group(1) + '\n' + props_html + '\n' + m.group(3), html)
+
+# Replace schedule upcoming section
+schedule_pattern = re.compile(
+    r'(<div id="p-schedule" class="tp">.*?<div class="sl">.*?</div>)(.*?)(<div class="sl rg">)',
+    re.DOTALL)
+html = schedule_pattern.sub(lambda m: m.group(1) + '\n' + schedule_html + '\n' + m.group(3), html)
+
+# Replace results section
+results_pattern = re.compile(
+    r'(<div class="sl rg">.*?</div>)(.*?)(</div>\s*</div>\s*<!-- CONTENT -->)',
+    re.DOTALL)
+html = results_pattern.sub(lambda m: m.group(1) + '\n' + results_html + '\n' + m.group(3), html)
+
+# Write final HTML
+with open("index.html", "w", encoding="utf-8") as f:
+    f.write(html)
+
+print(f"✅ Successfully updated index.html for {data['date']}")
+print(f"   LOW:  {lo['pick']} ({lo['odds']})")
+print(f"   MID:  {mi['pick']} ({mi['odds']})")
+print(f"   HIGH: {hi['pick']} ({hi['odds']})")
+print(f"   {len(data['schedule'])} games in schedule")
